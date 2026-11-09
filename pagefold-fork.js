@@ -1,16 +1,555 @@
-//@name pagefold
-//@display-name PageFold
+//@name pagefold-fork
+//@display-name PageFold Fork
 //@api 3.0
-//@version 0.2.7
+//@version 0.2.7.10
+//@update-url https://raw.githubusercontent.com/nanigaarimasuka/page-fold-fork/main/pagefold-fork.js
 (() => {
+  // [PAGEFOLD FORK] ------------------------------------------------------------
+  // Everything the fork adds lives in this block; the original code only calls
+  // into it from a few lines marked "PAGEFOLD FORK". To move to a new upstream
+  // version, paste this block back in and redo the marked lines.
+  //
+  // Adds a third file conversion mode, "png": the same black-on-white page
+  // rendering as the image PDF, but each page is sent as its own PNG image, so
+  // the request needs no PDF parser. Models whose ID names none of gemini, gpt
+  // or claude can only use it.
+  var PAGEFOLD_FORK_RENDER_MODES = ["text", "image", "png"];
+  var PAGEFOLD_FORK_RENDER_MODE_CHOICES = [["text", "PDF 텍스트"], ["image", "PDF 이미지"], ["png", "PNG 이미지"]];
+  var PAGEFOLD_FORK_RENDER_MODE_LABEL = "파일 변환 방식";
+  var PAGEFOLD_FORK_RENDER_MODE_HELP = "이 모델 프리셋에만 적용됩니다. PDF 이미지와 PNG 이미지는 글자를 그림으로 저장하며, PNG 이미지는 페이지마다 PNG 이미지를 따로 보냅니다. 모델 ID에 gemini\xB7gpt\xB7claude가 없으면 PNG 이미지만 쓸 수 있습니다. 저장 후 다음 요청부터 사용합니다.";
+  function pagefoldForkModelAllowsPdf(model) {
+    return /gemini|gpt|claude/iu.test(String(model || ""));
+  }
+  // With a model, a model that cannot take PDFs is held to "png".
+  function pagefoldForkRenderMode(value, model) {
+    const mode = PAGEFOLD_FORK_RENDER_MODES.includes(value) ? value : "text";
+    return model === void 0 || pagefoldForkModelAllowsPdf(model) ? mode : "png";
+  }
+  function pagefoldForkIsImageMode(value) {
+    return value === "image" || value === "png";
+  }
+  var PAGEFOLD_FORK_CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+      let c = n;
+      for (let k = 0; k < 8; k += 1) c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+  function pagefoldForkPngChunk(type, data) {
+    const out = new Uint8Array(12 + data.length);
+    const view = new DataView(out.buffer);
+    view.setUint32(0, data.length);
+    for (let i = 0; i < 4; i += 1) out[4 + i] = type.charCodeAt(i);
+    out.set(data, 8);
+    let crc = 4294967295;
+    for (let i = 4; i < 8 + data.length; i += 1) crc = PAGEFOLD_FORK_CRC_TABLE[(crc ^ out[i]) & 255] ^ crc >>> 8;
+    view.setUint32(8 + data.length, (crc ^ 4294967295) >>> 0);
+    return out;
+  }
+  // An 8-bit grayscale PNG of one rendered page.
+  async function pagefoldForkEncodePng(width, height, gray) {
+    const raw = new Uint8Array((width + 1) * height);
+    for (let y = 0; y < height; y += 1) raw.set(gray.subarray(y * width, (y + 1) * width), y * (width + 1) + 1);
+    const compressed = new Uint8Array(await new Response(
+      new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate"))
+    ).arrayBuffer());
+    const header = new Uint8Array(13);
+    const view = new DataView(header.buffer);
+    view.setUint32(0, width);
+    view.setUint32(4, height);
+    header[8] = 8;
+    const parts = [
+      new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+      pagefoldForkPngChunk("IHDR", header),
+      pagefoldForkPngChunk("IDAT", compressed),
+      pagefoldForkPngChunk("IEND", new Uint8Array(0))
+    ];
+    const png = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+      png.set(part, offset);
+      offset += part.length;
+    }
+    return png;
+  }
+  // Stands in for generateImagePdf: same pages in, one PNG per page out.
+  // bytes only carries the total size, which is all the callers read.
+  async function pagefoldForkEncodePngPages(pages, metadata = {}) {
+    const images = [];
+    let byteLength = 0;
+    for await (const page of pages) {
+      const { width, height, pixels } = page;
+      if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || !(pixels instanceof Uint8Array) || pixels.length !== width * height) {
+        throw new RangeError("Invalid grayscale PNG page");
+      }
+      const png = await pagefoldForkEncodePng(width, height, pixels);
+      byteLength += png.length;
+      images.push(base64(png));
+    }
+    if (!images.length) throw new RangeError("A PNG render needs at least one page");
+    return { ...metadata, bytes: { byteLength }, base64: images[0], images, pageCount: images.length, renderMode: "png" };
+  }
+  function pagefoldForkRenderOptions(renderMode, currentConfig = {}) {
+    const imageResolution = pagefoldForkResolution(currentConfig.imageResolution);
+    const pageTexts = [];
+    const onLine = (page, line) => (pageTexts[page] ??= []).push(line);
+    const encodePages = (pages, metadata) => {
+      if (renderMode === "png") return pagefoldForkEncodePngPages(pages, { ...metadata, imageResolution, pageTexts });
+      // PDF pages are also kept as PNGs so the last request can be looked at.
+      const previews = [];
+      return generateImagePdf((async function* () {
+        for await (const page of pages) {
+          previews.push(base64(await pagefoldForkEncodePng(page.width, page.height, page.pixels)));
+          yield page;
+        }
+      })(), { ...metadata, imageResolution, pageTexts, pagefoldForkPreviews: previews });
+    };
+    return { imageResolution, onLine, encodePages };
+  }
+  function pagefoldForkPayloadImages(entry) {
+    const extra = entry?.imageResolution ? { imageResolution: pagefoldForkResolution(entry.imageResolution) } : {};
+    return Array.isArray(entry?.images) && entry.images.length ? { ...extra, images: entry.images.map(String) } : extra;
+  }
+  function pagefoldForkPageLabel(pdf) {
+    return `[Attached page images: "${pdf.name}", ${pdf.images.length} page(s) in order.]`;
+  }
+  function pagefoldForkChatImageParts(pdf) {
+    return [
+      { type: "text", text: pagefoldForkPageLabel(pdf) },
+      ...pdf.images.map((data) => ({ type: "image_url", image_url: { url: `data:image/png;base64,${data}`, ...PAGEFOLD_FORK_IMAGE_DETAIL[pdf.imageResolution] ? { detail: PAGEFOLD_FORK_IMAGE_DETAIL[pdf.imageResolution] } : {} } }))
+    ];
+  }
+  function pagefoldForkGeminiImageParts(pdf) {
+    return [
+      { text: pagefoldForkPageLabel(pdf) },
+      ...pdf.images.map((data) => ({ inlineData: { mimeType: "image/png", data } }))
+    ];
+  }
+  // The packed prompt tells the model about "the attached PDF"; with PNG pages
+  // it is told about page images instead. Only the plugin's own sentences change.
+  function pagefoldForkRewordPacked(packed, options = {}) {
+    if (options.pdfRenderMode !== "png" || !packed) return packed;
+    const reword = (text) => String(text ?? "").replaceAll("The attached PDF contains", "The attached page images contain").replaceAll("Use the attached PDF as", "Use the attached page images as").replaceAll("[Use the attached PDF section headed", "[Use the attached page-image section headed").replaceAll("Inside the PDF page images", "Inside the page images");
+    return {
+      ...packed,
+      systemText: reword(packed.systemText),
+      ...packed.nativeMessages ? { nativeMessages: packed.nativeMessages.map((message) => ({ ...message, content: reword(message.content) })) } : {}
+    };
+  }
+  function packagePrompt(promptChat, mode = "maximum", options = {}) {
+    return pagefoldForkRewordPacked(packagePromptUpstream(promptChat, mode, options), options);
+  }
+  // The fork keeps its own storage keys, so it never shares settings with the
+  // original plugin. On the first run, when the fork has no settings yet, it
+  // copies the original's once.
+  var PAGEFOLD_FORK_UPSTREAM_CONFIG_KEY = "pagefold.config.v1";
+  var PAGEFOLD_FORK_UPSTREAM_SYNC_CONFIG_KEY = "pagefold.sync-config.v1";
+  async function pagefoldForkImportUpstreamConfig(local, synced) {
+    try {
+      if (await local.getItem(CONFIG_KEY) != null) return;
+      if (synced && await synced.getItem(SYNC_CONFIG_KEY) != null) return;
+      const upstreamLocal = await local.getItem(PAGEFOLD_FORK_UPSTREAM_CONFIG_KEY);
+      const upstreamSynced = synced ? await synced.getItem(PAGEFOLD_FORK_UPSTREAM_SYNC_CONFIG_KEY) : null;
+      if (upstreamSynced != null) await synced.setItem(SYNC_CONFIG_KEY, upstreamSynced);
+      if (upstreamLocal != null) await local.setItem(CONFIG_KEY, upstreamLocal);
+      if (upstreamLocal != null || upstreamSynced != null) console.info("[PageFold Fork] 원본 PageFold 설정을 한 번 가져왔습니다.");
+    } catch (error) {
+      console.warn("[PageFold Fork] 원본 설정을 가져오지 못했습니다.", error);
+    }
+  }
+  // Model names shown in Risu always say Fork, so profiles copied from the
+  // original never show up under the original's names.
+  function pagefoldForkModelName(name) {
+    const value = String(name || "PageFold Fork");
+    if (/fork/iu.test(value)) return value;
+    return /^PageFold(?![A-Za-z])/u.test(value) ? value.replace(/^PageFold/u, "PageFold Fork") : `${value} (Fork)`;
+  }
+  // One resolution setting for the PDF image and PNG modes. It sets both how
+  // densely the plugin draws the pages (pixels per point) and how finely the
+  // model is asked to read them. "auto" keeps the original behaviour.
+  var PAGEFOLD_FORK_RESOLUTIONS = ["auto", "low", "medium", "high"];
+  var PAGEFOLD_FORK_RESOLUTION_LABEL = "\uD574\uC0C1\uB3C4";
+  var PAGEFOLD_FORK_RESOLUTION_CHOICES = [["auto", "\uC790\uB3D9"], ["low", "\uB0AE\uC74C"], ["medium", "\uC911\uAC04"], ["high", "\uB192\uC74C"]];
+  var PAGEFOLD_FORK_RESOLUTION_HELP = "\uADF8\uB9AC\uB294 \uC774\uBBF8\uC9C0\uC758 \uD53D\uC140 \uBC00\uB3C4(\uB0AE\uC74C 1\uBC30\xB7\uC911\uAC04 1.5\uBC30\xB7\uB192\uC74C\xB7\uC790\uB3D9 2\uBC30)\uC640 \uBAA8\uB378\uC774 \uC77D\uB294 \uD574\uC0C1\uB3C4\uB97C \uD568\uAED8 \uC815\uD569\uB2C8\uB2E4. Gemini\uB294 \uD398\uC774\uC9C0\uB2F9 \uB0AE\uC74C 280\xB7\uC911\uAC04 560\xB7\uB192\uC74C 1120\uD1A0\uD070\uC774\uACE0, \uC790\uB3D9\uC740 \uC6D0\uB798 \uB3D9\uC791(Google\xB7Vertex \uB192\uC74C, \uAC8C\uC774\uD2B8\uC6E8\uC774\uB294 \uBAA8\uB378 \uAE30\uBCF8\uAC12)\uC744 \uB530\uB985\uB2C8\uB2E4. \uAC8C\uC774\uD2B8\uC6E8\uC774\uB85C \uBCF4\uB0B4\uB294 PDF \uC774\uBBF8\uC9C0\uB294 \uBAA8\uB378 \uCABD \uD574\uC0C1\uB3C4\uB97C \uC9C0\uC815\uD560 \uC218 \uC5C6\uC5B4 \uD53D\uC140 \uBC00\uB3C4\uB9CC \uBC14\uB01D\uB2C8\uB2E4. \uB0AE\uC744\uC218\uB85D \uC791\uC740 \uAE00\uC790\uB97C \uC798\uBABB \uC77D\uC744 \uC218 \uC788\uC2B5\uB2C8\uB2E4.";
+  var PAGEFOLD_FORK_PIXELS_PER_POINT = { auto: 2, low: 1, medium: 1.5, high: 2 };
+  var PAGEFOLD_FORK_GEMINI_MEDIA_RESOLUTION = { low: "MEDIA_RESOLUTION_LOW", medium: "MEDIA_RESOLUTION_MEDIUM", high: "MEDIA_RESOLUTION_HIGH" };
+  var PAGEFOLD_FORK_GEMINI_TOKENS = { low: 280, medium: 560, high: 1120 };
+  var PAGEFOLD_FORK_IMAGE_DETAIL = { low: "low", high: "high" };
+  function pagefoldForkResolution(value) {
+    return PAGEFOLD_FORK_RESOLUTIONS.includes(value) ? value : "auto";
+  }
+  // Read inside the image renderer, where it shadows the fixed PIXELS_PER_POINT.
+  function pagefoldForkPixelsPerPoint(options = {}) {
+    return PAGEFOLD_FORK_PIXELS_PER_POINT[pagefoldForkResolution(options.imageResolution)];
+  }
+  function pagefoldForkMediaResolution(pdfs, upstream) {
+    const level = pagefoldForkResolution(pdfs.find((pdf) => pdf.imageResolution)?.imageResolution);
+    return PAGEFOLD_FORK_GEMINI_MEDIA_RESOLUTION[level] || upstream;
+  }
+  function pagefoldForkIsGemini(provider, model) {
+    return provider === "google" || provider === "vertex" || /gemini/iu.test(String(model || ""));
+  }
+  // Input tokens per page for the request estimate. Image pages are counted by
+  // how the model reads them; text PDFs keep the original count.
+  function pagefoldForkTokensPerPage(currentConfig, model, upstream) {
+    const mode = currentConfig.pdfRenderMode;
+    if (!pagefoldForkIsImageMode(mode)) return upstream;
+    const level = pagefoldForkResolution(currentConfig.imageResolution);
+    const provider = currentConfig.activeProvider;
+    if (pagefoldForkIsGemini(provider, model)) {
+      const direct = provider === "google" || provider === "vertex";
+      // Gateways send PDFs without a resolution, so Gemini reads them at its PDF default.
+      if (!direct && mode === "image") return PAGEFOLD_FORK_GEMINI_TOKENS.medium;
+      return PAGEFOLD_FORK_GEMINI_TOKENS[level] || PAGEFOLD_FORK_GEMINI_TOKENS.high;
+    }
+    if (mode === "image") return upstream;
+    const ppp = PAGEFOLD_FORK_PIXELS_PER_POINT[level];
+    let width = Math.ceil(PAGE_WIDTH * ppp);
+    let height = Math.ceil(PAGE_HEIGHT * ppp);
+    if (/claude/iu.test(String(model || ""))) {
+      const scale = Math.min(1, 1568 / Math.max(width, height), Math.sqrt(1150000 / (width * height)));
+      return Math.ceil(width * scale * (height * scale) / 750);
+    }
+    if (/gpt/iu.test(String(model || ""))) {
+      if (level === "low") return 85;
+      const fit = Math.min(1, 2048 / Math.max(width, height));
+      width *= fit;
+      height *= fit;
+      const shrink = Math.min(1, 768 / Math.min(width, height));
+      return 85 + 170 * Math.ceil(width * shrink / 512) * Math.ceil(height * shrink / 512);
+    }
+    // Other vision models (e.g. DeepSeek V4.1 Flash caps an image at 1,024 tokens).
+    return Math.min(1024, Math.ceil(width * height / 1024));
+  }
+  // Image lab: keeps the pages of the last image-mode request in memory so they
+  // can be looked at, and runs an OCR check on them. Nothing is written to
+  // storage; a reload forgets it.
+  var PAGEFOLD_FORK_OCR_SYSTEM = "You are an OCR engine. Transcribe every character printed in the attached page image exactly as printed, in reading order, keeping one printed line per output line. Do not translate, correct, summarize, explain, or add anything. Backslash sequences such as \\n are printed characters: copy them as they appear. Output only the transcription.";
+  var PAGEFOLD_FORK_OCR_USER = "Transcribe the attached page image exactly.";
+  var PAGEFOLD_FORK_OCR_TIMEOUT_MS = 18e4;
+  function pagefoldForkOcrNormalize(text) {
+    return String(text ?? "").replaceAll("\\n", "").replace(/\s+/gu, "");
+  }
+  // Edit distance over code points, two rows at a time.
+  function pagefoldForkEditDistance(a, b) {
+    const x = [...a];
+    const y = [...b];
+    if (!x.length) return y.length;
+    if (!y.length) return x.length;
+    let previous = new Int32Array(y.length + 1);
+    let current = new Int32Array(y.length + 1);
+    for (let j = 0; j <= y.length; j += 1) previous[j] = j;
+    for (let i = 1; i <= x.length; i += 1) {
+      current[0] = i;
+      const xi = x[i - 1];
+      for (let j = 1; j <= y.length; j += 1) {
+        const cost = xi === y[j - 1] ? 0 : 1;
+        current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost);
+      }
+      [previous, current] = [current, previous];
+    }
+    return previous[y.length];
+  }
+  // Character error rate of an OCR result against the printed page text.
+  function pagefoldForkCharacterErrorRate(truth, ocr) {
+    const a = pagefoldForkOcrNormalize(truth);
+    const b = pagefoldForkOcrNormalize(ocr);
+    const distance = pagefoldForkEditDistance(a, b);
+    return { truthLength: [...a].length, ocrLength: [...b].length, distance, rate: a.length ? distance / [...a].length : b.length ? 1 : 0 };
+  }
+  // Differing stretches between printed lines and OCR lines. Lines are matched
+  // by their whitespace-free text; a stretch whose joined text still matches
+  // (the model only wrapped differently) is not reported.
+  function pagefoldForkOcrDiff(truthLines, ocrText) {
+    const a = truthLines.map(String);
+    const b = String(ocrText ?? "").split(/\r?\n/u).filter((line) => line.trim());
+    const na = a.map(pagefoldForkOcrNormalize);
+    const nb = b.map(pagefoldForkOcrNormalize);
+    const table = Array.from({ length: a.length + 1 }, () => new Int32Array(b.length + 1));
+    for (let i = a.length - 1; i >= 0; i -= 1) {
+      for (let j = b.length - 1; j >= 0; j -= 1) {
+        table[i][j] = na[i] === nb[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
+      }
+    }
+    const hunks = [];
+    let i = 0;
+    let j = 0;
+    let hunk = null;
+    const flush = () => {
+      if (hunk && hunk.truth.map(pagefoldForkOcrNormalize).join("") !== hunk.ocr.map(pagefoldForkOcrNormalize).join("")) hunks.push(hunk);
+      hunk = null;
+    };
+    while (i < a.length || j < b.length) {
+      if (i < a.length && j < b.length && na[i] === nb[j]) {
+        flush();
+        i += 1;
+        j += 1;
+      } else {
+        hunk ??= { line: i + 1, truth: [], ocr: [] };
+        if (j >= b.length || i < a.length && table[i + 1][j] >= table[i][j + 1]) hunk.truth.push(a[i++]);
+        else hunk.ocr.push(b[j++]);
+      }
+    }
+    flush();
+    return hunks;
+  }
+  // Reads back the 8-bit grayscale PNGs this fork writes (filter 0 rows only).
+  async function pagefoldForkDecodePng(data) {
+    const bytes = Uint8Array.from(atob(data), (character) => character.charCodeAt(0));
+    const view = new DataView(bytes.buffer);
+    const width = view.getUint32(16);
+    const height = view.getUint32(20);
+    const chunks = [];
+    for (let offset = 8; offset < bytes.length; ) {
+      const length = view.getUint32(offset);
+      if (String.fromCharCode(...bytes.subarray(offset + 4, offset + 8)) === "IDAT") chunks.push(bytes.subarray(offset + 8, offset + 8 + length));
+      offset += 12 + length;
+    }
+    const raw = new Uint8Array(await new Response(new Blob(chunks).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer());
+    const pixels = new Uint8Array(width * height);
+    for (let y = 0; y < height; y += 1) pixels.set(raw.subarray(y * (width + 1) + 1, (y + 1) * (width + 1)), y * width);
+    return { width, height, pixels };
+  }
+  function pagefoldForkPickPages(count, wanted) {
+    const want = Math.max(1, Math.min(count, wanted));
+    const picks = new Set();
+    for (let k = 0; k < want; k += 1) picks.add(want === 1 ? 0 : Math.round(k * (count - 1) / (want - 1)));
+    return [...picks];
+  }
+  function pagefoldForkCreateLab({ callers, html, number, routeName, render, loadRequestLogs, loadConfig, profileConfig }) {
+    let last = null;
+    let memory = null;
+    let rebuilt = null;
+    let current = null;
+    let running = null;
+    // What a request log keeps so its pages can be drawn again exactly.
+    function logFields(currentConfig, packed, profile) {
+      if (!pagefoldForkIsImageMode(currentConfig.pdfRenderMode)) return {};
+      const documents = packed.pdfDocuments || (packed.pdfTranscript ? [{ name: "context", transcript: packed.pdfTranscript }] : []);
+      return { pagefoldForkRender: { profileId: profile?.id, mode: currentConfig.pdfRenderMode, fontSize: currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE, imageResolution: pagefoldForkResolution(currentConfig.imageResolution), documents: documents.map((document2) => ({ name: document2.name, transcript: document2.transcript })) } };
+    }
+    // The newest image-mode request: kept in memory, or drawn again from the request log.
+    async function resolve(useCurrent = false) {
+      const logs = (await loadRequestLogs()).entries;
+      const saved = await loadConfig();
+      const profileOf = (entry) => saved.models.find((profile) => profile.id === entry.pagefoldForkRender?.profileId) || saved.models.find((profile) => profile.name === entry.profileName && profile.model === entry.model);
+      const entry = logs.find((current) => current.pagefoldForkRender ? pagefoldForkIsImageMode(current.pagefoldForkRender.mode) : pagefoldForkIsImageMode(profileOf(current)?.pdfRenderMode) && current.pdfContent);
+      const entryAt = entry ? Date.parse(entry.timestamp) || 0 : 0;
+      if (useCurrent) return (last = await redrawWithCurrent(memory && memory.at >= entryAt ? null : entry, saved, profileOf, entryAt));
+      if (memory && memory.at >= entryAt) return (last = memory);
+      if (!entry) return (last = memory);
+      if (rebuilt?.logId === entry.id) return (last = rebuilt);
+      const profile = profileOf(entry);
+      if (!profile) return (last = memory);
+      const stored = entry.pagefoldForkRender;
+      const settings = stored ? { pdfRenderMode: stored.mode, imageFontSize: stored.fontSize, imageResolution: stored.imageResolution } : { pdfRenderMode: profile.pdfRenderMode, imageFontSize: profile.imageFontSize, imageResolution: profile.imageResolution };
+      const currentConfig = { ...profileConfig(saved, profile), ...settings };
+      // Logs from before this field hold the escaped text of all documents as one.
+      const documents = stored?.documents?.length ? stored.documents : [{ name: "context", transcript: entry.pdfContent }];
+      output('<section class="pf-card full" style="margin-top:14px"><p class="pf-help">요청 로그에서 페이지를 다시 그리는 중…</p></section>');
+      const values = [];
+      for (const document2 of documents) {
+        values.push({ ...await render(document2.transcript, { fontSize: currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE, ...pagefoldForkRenderOptions(currentConfig.pdfRenderMode, currentConfig) }), name: document2.name });
+      }
+      rebuilt = build(currentConfig, values, entryAt, { logId: entry.id, exact: Boolean(stored) });
+      return (last = rebuilt);
+    }
+    // Only the text comes from the newest request; mode, font size, resolution
+    // and provider settings are the profile's current ones.
+    async function redrawWithCurrent(entry, saved, profileOf, entryAt) {
+      let documents;
+      let profile;
+      let at;
+      let source;
+      if (entry) {
+        profile = profileOf(entry);
+        documents = entry.pagefoldForkRender?.documents?.length ? entry.pagefoldForkRender.documents : [{ name: "context", transcript: entry.pdfContent }];
+        at = entryAt;
+        source = entry.id;
+      } else if (memory?.documents?.length) {
+        profile = saved.models.find((candidate) => candidate.provider === memory.provider && candidate.model === memory.model && candidate.pdfRenderMode === memory.mode) || saved.models.find((candidate) => candidate.provider === memory.provider && candidate.model === memory.model);
+        documents = memory.documents;
+        at = memory.at;
+        source = `memory-${memory.at}`;
+      } else return null;
+      if (!profile) return null;
+      const currentConfig = profileConfig(saved, profile);
+      if (!pagefoldForkIsImageMode(currentConfig.pdfRenderMode)) {
+        output(`<section class="pf-card full" style="margin-top:14px"><p class="pf-help">${html(profile.name)} 프리셋이 지금 PDF 텍스트 방식이라 이미지로 그릴 수 없습니다. 파일 변환 방식을 PDF 이미지나 PNG 이미지로 바꾸거나 '지금 설정으로'를 끄세요.</p></section>`);
+        return null;
+      }
+      const key = JSON.stringify([source, currentConfig.pdfRenderMode, currentConfig.imageFontSize, currentConfig.imageResolution, currentConfig.activeProvider, currentConfig[currentConfig.activeProvider]]);
+      if (current?.key === key) return current;
+      output('<section class="pf-card full" style="margin-top:14px"><p class="pf-help">지금 프로필 설정으로 페이지를 다시 그리는 중…</p></section>');
+      const values = [];
+      for (const document2 of documents) {
+        values.push({ ...await render(document2.transcript, { fontSize: currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE, ...pagefoldForkRenderOptions(currentConfig.pdfRenderMode, currentConfig) }), name: document2.name });
+      }
+      current = build(currentConfig, values, at, { current: true });
+      current.key = key;
+      return current;
+    }
+    function remember(currentConfig, values, packed) {
+      if (!pagefoldForkIsImageMode(currentConfig.pdfRenderMode)) return;
+      memory = build(currentConfig, values, Date.now(), null);
+      memory.documents = packed?.pdfDocuments || (packed?.pdfTranscript ? [{ name: "context", transcript: packed.pdfTranscript }] : []);
+    }
+    function build(currentConfig, values, at, log) {
+      const mode = currentConfig.pdfRenderMode;
+      const route = currentConfig[currentConfig.activeProvider] || {};
+      const pages = [];
+      for (const value of values) {
+        const previews = value.pagefoldForkPreviews || value.images || [];
+        previews.forEach((preview, index) => pages.push({
+          document: value.name,
+          index,
+          preview,
+          send: mode === "png" ? { base64: preview, images: [preview] } : null,
+          lines: value.pageTexts?.[index] || []
+        }));
+      }
+      return {
+        at,
+        log,
+        config: currentConfig,
+        mode,
+        provider: currentConfig.activeProvider,
+        model: route.model,
+        fontSize: currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE,
+        imageResolution: pagefoldForkResolution(currentConfig.imageResolution),
+        pixelsPerPoint: values[0]?.pixelsPerPoint,
+        bytes: values.reduce((total, value) => total + (value.bytes?.byteLength || 0), 0),
+        pdfs: mode === "image" ? values.map((value) => ({ name: value.name, base64: value.base64 })) : [],
+        pages
+      };
+    }
+    function toolbarHtml() {
+      return `<button id="pff-lab-view" class="pf-button" type="button">마지막 이미지 보기</button><label class="pf-log-switch" title="끄면 마지막 요청을 보냈을 때의 설정으로 그립니다"><input id="pff-lab-current" type="checkbox" checked><span>지금 설정으로</span></label><label class="pf-log-switch" title="검사할 페이지 수">OCR<input id="pff-ocr-pages" type="number" min="1" max="10" value="3" style="width:46px;margin-left:6px"></label><button id="pff-lab-ocr" class="pf-button" type="button">OCR 검사</button>`;
+    }
+    function output(markup) {
+      const target = document.getElementById("pff-lab-output");
+      if (target) target.innerHTML = markup;
+    }
+    function summary() {
+      const width = Math.ceil(PAGE_WIDTH * (last.pixelsPerPoint || 2));
+      const height = Math.ceil(PAGE_HEIGHT * (last.pixelsPerPoint || 2));
+      const origin = last.log?.current ? "마지막 요청의 원문을 지금 프로필 설정으로 다시 그림" : !last.log ? "이번 세션에서 보낸 그대로" : last.log.exact ? "요청 로그에서 같은 설정으로 다시 그림" : "요청 로그의 원문을 지금 프로필 설정으로 다시 그림 (이 기능 이전 요청이라 설정이 바뀌었으면 실제와 다를 수 있음)";
+      return `${origin} · ${new Date(last.at).toLocaleString()} · ${html(routeName(last.provider))} / ${html(last.model)} · ${last.mode === "png" ? "PNG 이미지" : "PDF 이미지"} · 해상도 ${html(last.imageResolution)} (${width}×${height}px) · 글자 ${html(last.fontSize)}pt · ${number(last.pages.length)}페이지 · ${number(last.bytes)} bytes`;
+    }
+    const missing = '<section class="pf-card full" style="margin-top:14px"><p class="pf-help">PDF 이미지·PNG 이미지 방식으로 보낸 요청을 찾지 못했습니다. 요청 로그 저장을 켠 상태로 요청을 한 번 보내거나, 이 브라우저에서 요청을 보낸 뒤 다시 눌러 주세요. 요청 로그의 프로필이 지워졌어도 다시 그릴 수 없습니다.</p></section>';
+    const useCurrent = () => document.getElementById("pff-lab-current")?.checked === true;
+    async function view() {
+      if (!await resolve(useCurrent())) return document.getElementById("pff-lab-output")?.innerHTML.includes("PDF 텍스트 방식") ? void 0 : output(missing);
+      const pdfLinks = last.pdfs.map((pdf) => `<a class="pf-button" download="${html(pdf.name)}.pdf" href="data:application/pdf;base64,${pdf.base64}">${html(pdf.name)}.pdf 내려받기</a>`).join(" ");
+      output(`<section class="pf-card full" style="margin-top:14px"><h2>${last.log?.current ? "지금 설정으로 다시 그린 이미지" : "마지막으로 보낸 이미지"}</h2><p class="pf-help">${summary()}</p>${pdfLinks ? `<p>${pdfLinks}</p><p class="pf-help">PDF 안의 페이지 그림을 PNG로 함께 보여 줍니다.</p>` : ""}${last.pages.map((page) => `<figure style="margin:14px 0"><figcaption class="pf-help">${html(page.document)} · ${page.index + 1}페이지 <a download="${html(page.document)}-${page.index + 1}.png" href="data:image/png;base64,${page.preview}">PNG 내려받기</a></figcaption><img alt="" src="data:image/png;base64,${page.preview}" style="width:100%;height:auto;background:#fff;border:1px solid #334155"></figure>`).join("")}</section>`);
+    }
+    async function ocr(wanted) {
+      if (running) return;
+      if (!await resolve(useCurrent())) return document.getElementById("pff-lab-output")?.innerHTML.includes("PDF 텍스트 방식") ? void 0 : output(missing);
+      const call = callers[last.provider];
+      if (!call) return output(`<section class="pf-card full" style="margin-top:14px"><p class="pf-help">${html(last.provider)} 프로바이더는 OCR 검사를 지원하지 않습니다.</p></section>`);
+      const picks = pagefoldForkPickPages(last.pages.length, wanted).map((index) => last.pages[index]);
+      const inputPerPage = pagefoldForkTokensPerPage(last.config, last.model, PAGEFOLD_FORK_GEMINI_TOKENS.medium);
+      const outputTokens = picks.reduce((total, page) => total + estimateTextTokens(page.lines.join("")), 0);
+      const inputTokens = inputPerPage * picks.length;
+      const price = Number(last.config[last.provider]?.inputPrice);
+      const cost = Number.isFinite(price) && price > 0 ? ` · 입력 비용 약 $${(inputTokens * price / 1e6).toFixed(4)}` : "";
+      if (typeof confirm === "function" && !confirm(`OCR 검사: ${picks.length}페이지를 ${routeName(last.provider)} / ${last.model}에 다시 보냅니다.\n예상 입력 약 ${inputTokens}토큰, 출력 약 ${outputTokens}토큰${cost}\n진행할까요?`)) return;
+      if (running) return;
+      const config = { ...last.config, [last.provider]: { ...last.config[last.provider], streaming: false } };
+      const rows = [];
+      running = new AbortController();
+      const stop = running;
+      try {
+      for (const [position, page] of picks.entries()) {
+        if (stop.signal.aborted) break;
+        const sentAt = new Date().toLocaleTimeString();
+        output(`<section class="pf-card full" style="margin-top:14px"><p class="pf-help">OCR 검사 중… ${position + 1}/${picks.length} · ${sentAt}에 요청을 보냈습니다. 응답을 기다리는 중이며 ${PAGEFOLD_FORK_OCR_TIMEOUT_MS / 1e3}초가 지나면 이 페이지는 실패로 넘어갑니다.</p><button id="pff-ocr-stop" class="pf-button danger" type="button">중단</button></section>`);
+        document.getElementById("pff-ocr-stop")?.addEventListener("click", () => stop.abort());
+        console.info(`[PageFold Fork OCR] ${position + 1}/${picks.length} ${page.document} p${page.index + 1} 요청 보냄`);
+        const packed = { mode: "maximum", systemText: PAGEFOLD_FORK_OCR_SYSTEM, userText: PAGEFOLD_FORK_OCR_USER };
+        try {
+          // A PDF page is rebuilt from its PNG only when it is checked.
+          const send = page.send || { base64: (await generateImagePdf((async function* () {
+            yield await pagefoldForkDecodePng(page.preview);
+          })())).base64 };
+          const payload = [{ name: `${page.document}-page-${page.index + 1}`, imageResolution: last.imageResolution, ...send }];
+          const maxTokens = Math.min(16384, Math.max(2048, Math.ceil(estimateTextTokens(page.lines.join("")) * 2) + 1024));
+          const timeout = new AbortController();
+          const abortTimeout = () => timeout.abort();
+          stop.signal.addEventListener("abort", abortTimeout, { once: true });
+          let timedOut = false;
+          const timer = setTimeout(() => {
+            timedOut = true;
+            timeout.abort();
+          }, PAGEFOLD_FORK_OCR_TIMEOUT_MS);
+          let result;
+          try {
+            result = await call({ max_tokens: maxTokens, temperature: 0, top_p: 1, prompt_chat: [] }, packed, payload, config, timeout.signal, null);
+          } catch (error) {
+            if (timedOut) throw new Error(`${PAGEFOLD_FORK_OCR_TIMEOUT_MS / 1e3}초 안에 응답이 오지 않았습니다. (출력 상한 ${maxTokens}토큰)`);
+            if (stop.signal.aborted) throw new Error("중단했습니다.");
+            throw error;
+          } finally {
+            clearTimeout(timer);
+            stop.signal.removeEventListener("abort", abortTimeout);
+          }
+          console.info(`[PageFold Fork OCR] ${page.document} p${page.index + 1} 응답 받음 · 입력 ${result.inputTokens} · 출력 ${result.outputTokens}`);
+          rows.push({ page, result, score: pagefoldForkCharacterErrorRate(page.lines.join("\n"), result.text), hunks: pagefoldForkOcrDiff(page.lines, result.text) });
+        } catch (error) {
+          console.warn("[PageFold Fork OCR] 실패", error);
+          rows.push({ page, error: error?.message || String(error) });
+        }
+      }
+      } finally {
+        running = null;
+      }
+      const scored = rows.filter((row) => row.score);
+      const totalTruth = scored.reduce((total, row) => total + row.score.truthLength, 0);
+      const totalDistance = scored.reduce((total, row) => total + row.score.distance, 0);
+      const overall = totalTruth ? `${number(totalDistance / totalTruth * 100, 2)}%` : "-";
+      const body = rows.map((row) => {
+        const title = `${html(row.page.document)} · ${row.page.index + 1}페이지`;
+        if (row.error) return `<details open><summary>${title} · 실패</summary><pre>${html(row.error)}</pre></details>`;
+        const { score, result, hunks } = row;
+        const diff = hunks.length ? hunks.slice(0, 50).map((hunk) => `<div style="margin:8px 0"><div class="pf-help">원문 ${hunk.line}번째 줄 근처</div><pre style="background:#3f1d1d;white-space:pre-wrap;margin:2px 0">${html(hunk.truth.join("\n") || "(없음)")}</pre><pre style="background:#14361f;white-space:pre-wrap;margin:2px 0">${html(hunk.ocr.join("\n") || "(없음)")}</pre></div>`).join("") + (hunks.length > 50 ? `<p class="pf-help">외 ${hunks.length - 50}곳</p>` : "") : '<p class="pf-help">다른 곳이 없습니다.</p>';
+        return `<details><summary>${title} · 오류율 ${number(score.rate * 100, 2)}% (원문 ${number(score.truthLength)}자 / 인식 ${number(score.ocrLength)}자 / 편집 거리 ${number(score.distance)}) · 입력 ${number(result.inputTokens)} · 출력 ${number(result.outputTokens)}</summary><p class="pf-help">빨강은 원문, 초록은 모델이 읽은 글입니다. 공백·줄바꿈 차이는 세지 않습니다.</p>${diff}<details><summary>모델 응답 전체</summary><pre style="white-space:pre-wrap">${html(result.text)}</pre></details></details>`;
+      }).join("");
+      output(`<section class="pf-card full" style="margin-top:14px"><h2>OCR 검사 결과 · 전체 오류율 ${overall}</h2><p class="pf-help">${summary()}</p>${body}</section>`);
+    }
+    function bind() {
+      document.getElementById("pff-lab-view")?.addEventListener("click", view);
+      document.getElementById("pff-lab-ocr")?.addEventListener("click", () => ocr(Number(document.getElementById("pff-ocr-pages")?.value) || 3));
+    }
+    return { remember, logFields, toolbarHtml, bind, view, ocr, get last() { return last; } };
+  }
+  // Holds the mode select to PNG while the model ID cannot take PDFs.
+  function pagefoldForkBindRenderModeLimit(id) {
+    const select = document.getElementById(`profile-${id}-pdf-mode`);
+    const model = document.getElementById(`profile-${id}-model`);
+    if (!select || !model) return;
+    const apply = () => {
+      const allowed = pagefoldForkModelAllowsPdf(model.value);
+      for (const option of select.options) option.disabled = !allowed && option.value !== "png";
+      if (!allowed && select.value !== "png") {
+        select.value = "png";
+        select.dispatchEvent(new Event("change"));
+      }
+    };
+    model.addEventListener("input", apply);
+    apply();
+  }
+  // [/PAGEFOLD FORK] -----------------------------------------------------------
   // src/core.js
-  var PAGEFOLD_ID = "pagefold";
-  var PAGEFOLD_VERSION = "0.2.7";
-  var CONFIG_KEY = "pagefold.config.v1";
-  var SYNC_CONFIG_KEY = "pagefold.sync-config.v1";
+  var PAGEFOLD_ID = "pagefold-fork"; /* PAGEFOLD FORK */
+  var PAGEFOLD_VERSION = "0.2.7.10"; /* PAGEFOLD FORK */
+  var CONFIG_KEY = "pagefold-fork.config.v1"; /* PAGEFOLD FORK */
+  var SYNC_CONFIG_KEY = "pagefold-fork.sync-config.v1"; /* PAGEFOLD FORK */
   var SYNC_CONFIG_VERSION = 2;
-  var STATS_KEY = "pagefold.stats.v1";
-  var REQUEST_LOGS_KEY = "pagefold.request-logs.v1";
+  var STATS_KEY = "pagefold-fork.stats.v1"; /* PAGEFOLD FORK */
+  var REQUEST_LOGS_KEY = "pagefold-fork.request-logs.v1"; /* PAGEFOLD FORK */
   var REQUEST_LOG_LIMIT = 20;
   var GEMINI_PDF_TOKENS_PER_PAGE = 280;
   var GEMINI_IMAGE_PDF_TOKENS_PER_PAGE = 1120;
@@ -139,7 +678,7 @@
       image: "Image"
     };
     const modelName = source.split(/[-_]/u).filter(Boolean).map((part) => labels[part.toLowerCase()] || part).join(" ");
-    return `PageFold ${modelName}`;
+    return `PageFold Fork ${modelName}`; /* PAGEFOLD FORK */
   }
   function normalizeProfileId(value, index, usedIds) {
     const base = String(value || `model-${index + 1}`).toLowerCase().replace(/[^a-z0-9_-]+/gu, "-").replace(/^-+|-+$/gu, "") || `model-${index + 1}`;
@@ -214,8 +753,9 @@
         streaming: profile.streaming === true,
         // Profiles saved before this field existed inherit their former shared mode.
         packagingMode: PACKAGING_MODES.has(profile.packagingMode) ? profile.packagingMode : config.packagingMode,
-        pdfRenderMode: profile.pdfRenderMode === "image" ? "image" : "text",
+        pdfRenderMode: pagefoldForkRenderMode(profile.pdfRenderMode, model), /* PAGEFOLD FORK */
         imageFontSize: normalizeImageFontSize(profile.imageFontSize),
+        imageResolution: pagefoldForkResolution(profile.imageResolution), /* PAGEFOLD FORK */
         providerRoute: normalizeProviderRoute(profile.providerRoute),
         inputPrice: normalizeProfileInputPrice(profile.inputPrice, route.inputPrice),
         parameters: normalizeModelParameterOverrides(profile.parameters)
@@ -374,8 +914,8 @@ ${content}` : content;
     }
     return merged;
   }
-  function packagePrompt(promptChat, mode = "maximum", options = {}) {
-    const newlineDirective = options.pdfRenderMode === "image" ? PDF_IMAGE_NEWLINE_MARKER_DIRECTIVE : PDF_NEWLINE_MARKER_DIRECTIVE;
+  function packagePromptUpstream(promptChat, mode = "maximum", options = {}) { /* PAGEFOLD FORK */
+    const newlineDirective = pagefoldForkIsImageMode(options.pdfRenderMode) ? PDF_IMAGE_NEWLINE_MARKER_DIRECTIVE : PDF_NEWLINE_MARKER_DIRECTIVE;
     const source = Array.isArray(promptChat) ? promptChat : [];
     const messages = options.mergeConsecutiveRoles === true ? mergeConsecutiveRoleMessages(source) : source;
     const baselineText = messages.map((message) => String(message?.content || "")).join("\n");
@@ -483,7 +1023,7 @@ ${systemText}` : `Use the attached PDF as the ordered conversation context and p
   }
   function normalizePdfPayloads(value) {
     const source = Array.isArray(value) ? value : [value];
-    return source.map((entry, index) => typeof entry === "string" ? { name: index === 0 ? "context" : `document-${index + 1}`, base64: entry } : { name: String(entry?.name || `document-${index + 1}`), base64: String(entry?.base64 || "") }).filter((entry) => entry.base64);
+    return source.map((entry, index) => typeof entry === "string" ? { name: index === 0 ? "context" : `document-${index + 1}`, base64: entry } : { name: String(entry?.name || `document-${index + 1}`), base64: String(entry?.base64 || ""), ...pagefoldForkPayloadImages(entry) /* PAGEFOLD FORK */ }).filter((entry) => entry.base64);
   }
   function nativeOpenAiMessages(messages) {
     return (messages || []).map((message) => ({
@@ -529,10 +1069,10 @@ ${systemText}` : `Use the attached PDF as the ordered conversation context and p
   }
   function buildGeminiRequest(args, packed, pdfBase64, options = {}) {
     const pdfs = normalizePdfPayloads(pdfBase64);
-    const parts = pdfs.map((pdf) => ({ inlineData: { mimeType: "application/pdf", data: pdf.base64 } }));
+    const parts = pdfs.flatMap((pdf) => pdf.images ? pagefoldForkGeminiImageParts(pdf) : [{ inlineData: { mimeType: "application/pdf", data: pdf.base64 } }]); /* PAGEFOLD FORK */
     if (packed.userText) parts.push({ text: packed.userText });
     const generationConfig = {
-      mediaResolution: options.pdfRenderMode === "image" ? "MEDIA_RESOLUTION_HIGH" : "MEDIA_RESOLUTION_LOW",
+      mediaResolution: pagefoldForkMediaResolution(pdfs, pagefoldForkIsImageMode(options.pdfRenderMode) ? "MEDIA_RESOLUTION_HIGH" : "MEDIA_RESOLUTION_LOW"), /* PAGEFOLD FORK */
       maxOutputTokens: Math.max(1, Number.isFinite(Number(args.max_tokens)) ? Number(args.max_tokens) : 4096),
       temperature: Number.isFinite(Number(args.temperature)) ? Number(args.temperature) : 0,
       topP: Number.isFinite(Number(args.top_p)) ? Number(args.top_p) : 0.95,
@@ -573,7 +1113,8 @@ ${systemText}` : `Use the attached PDF as the ordered conversation context and p
     const pdfs = normalizePdfPayloads(pdfBase64);
     const content = [];
     if (packed.userText) content.push({ type: "text", text: packed.userText });
-    for (const pdf of pdfs) content.push({
+    for (const pdf of pdfs) if (pdf.images) content.push(...pagefoldForkChatImageParts(pdf)); /* PAGEFOLD FORK */
+    else content.push({
       type: "file",
       file: {
         filename: `document-${pdf.name.replace(/[^a-z0-9._-]+/giu, "-").replace(/^-+|-+$/gu, "") || "context"}.pdf`,
@@ -621,7 +1162,7 @@ ${firstSystem.content}`;
     request.stream = options.streaming === true;
     if (request.stream) request.stream_options = { include_usage: true };
     const plugins = [];
-    if (normalizePdfPayloads(pdfBase64).length) plugins.push({ id: "file-parser", pdf: { engine: "native" } });
+    if (normalizePdfPayloads(pdfBase64).some((pdf) => !pdf.images) /* PAGEFOLD FORK */) plugins.push({ id: "file-parser", pdf: { engine: "native" } });
     if (args.response_schema?.schema && options.streaming !== true) {
       plugins.push({ id: "response-healing" });
     }
@@ -811,10 +1352,10 @@ ${firstSystem.content}`;
   }
   function sanitizeLogPayload(value, pdfBytes = 0) {
     const byteCount = Math.max(0, Number(pdfBytes) || 0);
-    const placeholder = `[PDF \uB0B4\uC6A9 \uD0ED \uCC38\uC870 \xB7 ${byteCount} bytes]`;
+    const placeholder = `[\uD30C\uC77C \uBCF8\uBB38 \uD0ED \uCC38\uC870 \xB7 ${byteCount} bytes]` /* PAGEFOLD FORK */;
     const visit = (current) => {
       if (typeof current === "string") {
-        return /^data:application\/pdf;base64,/iu.test(current) ? placeholder : current;
+        return /^data:(?:application\/pdf|image\/png);base64,/iu.test(current) /* PAGEFOLD FORK */ ? placeholder : current;
       }
       if (Array.isArray(current)) return current.map(visit);
       if (!current || typeof current !== "object") return current;
@@ -822,7 +1363,7 @@ ${firstSystem.content}`;
       const result = {};
       for (const [key, item] of Object.entries(current)) {
         if (key.startsWith("__pagefold")) continue;
-        if (key === "data" && mimeType === "application/pdf" && typeof item === "string") {
+        if (key === "data" && (mimeType === "application/pdf" || mimeType === "image/png") /* PAGEFOLD FORK */ && typeof item === "string") {
           result[key] = placeholder;
         } else {
           result[key] = visit(item);
@@ -851,7 +1392,7 @@ ${firstSystem.content}`;
   function createRequestLogExport(value, options = {}) {
     const logs = normalizeRequestLogs(value);
     return {
-      format: "pagefold-request-logs",
+      format: "pagefold-fork-request-logs", /* PAGEFOLD FORK */
       version: 1,
       pluginVersion: String(options.pluginVersion || PAGEFOLD_VERSION),
       exportedAt: String(options.exportedAt || (/* @__PURE__ */ new Date()).toISOString()),
@@ -1118,14 +1659,14 @@ Q`)),
   // src/image-pdf.js
   var IMAGE_FONTS = [
     {
-      family: "PageFold Image Text",
-      key: "pagefold.image-font.noto-cjk-sans-2.004",
+      family: "PageFold Fork Image Text", /* PAGEFOLD FORK */
+      key: "pagefold-fork.image-font.noto-cjk-sans-2.004", /* PAGEFOLD FORK */
       url: "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@Sans2.004/Sans/OTF/Korean/NotoSansCJKkr-Regular.otf",
       label: "\uD55C\uAE00 \uAE00\uAF34"
     },
     {
-      family: "PageFold Image Emoji",
-      key: "pagefold.image-font.noto-emoji-8b0a1d0",
+      family: "PageFold Fork Image Emoji", /* PAGEFOLD FORK */
+      key: "pagefold-fork.image-font.noto-emoji-8b0a1d0", /* PAGEFOLD FORK */
       url: "https://cdn.jsdelivr.net/gh/google/fonts@8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/ofl/notoemoji/NotoEmoji%5Bwght%5D.ttf",
       label: "\uC774\uBAA8\uC9C0 \uAE00\uAF34"
     }
@@ -1177,7 +1718,7 @@ Q`)),
       const pending = (async () => {
         const fontSet = environment.document?.fonts ?? environment.fonts;
         if (!environment.FontFace || !fontSet) {
-          throw new Error("\uC774\uBBF8\uC9C0 PDF\uC5D0 \uD544\uC694\uD55C \uBE0C\uB77C\uC6B0\uC800 \uAE00\uAF34 API\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
+          throw new Error("\uC774\uBBF8\uC9C0 \uB80C\uB354\uB9C1\uC5D0 \uD544\uC694\uD55C \uBE0C\uB77C\uC6B0\uC800 \uAE00\uAF34 API\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
         }
         const register = async (data2) => {
           const face = new environment.FontFace(asset.family, data2);
@@ -1215,6 +1756,7 @@ Q`)),
     return async function generateImageTranscriptPdf(transcript, options = {}) {
       const { signal, log = () => {
       } } = options;
+      const PIXELS_PER_POINT = pagefoldForkPixelsPerPoint(options); /* PAGEFOLD FORK */
       const fontSize = options.fontSize ?? DEFAULT_IMAGE_FONT_SIZE;
       if (!Number.isFinite(fontSize) || fontSize < 2 || fontSize > 24) {
         throw new RangeError("Image PDF fontSize must be between 2 and 24 points");
@@ -1226,11 +1768,11 @@ Q`)),
       const width = Math.ceil(PAGE_WIDTH * PIXELS_PER_POINT);
       const height = Math.ceil(PAGE_HEIGHT * PIXELS_PER_POINT);
       const canvas = environment.OffscreenCanvas ? new environment.OffscreenCanvas(width, height) : environment.document?.createElement("canvas");
-      if (!canvas) throw new Error("\uC774\uBBF8\uC9C0 PDF\uB97C \uADF8\uB9B4 Canvas\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
+      if (!canvas) throw new Error("\uC774\uBBF8\uC9C0\uB97C \uADF8\uB9B4 Canvas\uB97C \uC0AC\uC6A9\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
       canvas.width = width;
       canvas.height = height;
       const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) throw new Error("\uC774\uBBF8\uC9C0 PDF\uC758 Canvas 2D \uB80C\uB354\uB9C1\uC744 \uC2DC\uC791\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.");
+      if (!context) throw new Error("\uC774\uBBF8\uC9C0\uC758 Canvas 2D \uB80C\uB354\uB9C1\uC744 \uC2DC\uC791\uD558\uC9C0 \uBABB\uD588\uC2B5\uB2C8\uB2E4.");
       const lineHeight = fontSize * 1.4;
       const margin = MARGIN * PIXELS_PER_POINT;
       const linePixels = lineHeight * PIXELS_PER_POINT;
@@ -1260,10 +1802,11 @@ Q`)),
         for (const line of lines) {
           checkAborted(signal);
           context.fillText(line, margin, margin + row * linePixels);
+          options.onLine?.(pageCount, line); /* PAGEFOLD FORK */
           row += 1;
           if (row === rows) {
             yield { width, height, pixels: pixels() };
-            log("\uC774\uBBF8\uC9C0 PDF \uD398\uC774\uC9C0 \uC0DD\uC131", `${++pageCount}\uD398\uC774\uC9C0`);
+            log("\uC774\uBBF8\uC9C0 \uD398\uC774\uC9C0 \uC0DD\uC131", `${++pageCount}\uD398\uC774\uC9C0`);
             row = 0;
             clear();
             await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1272,11 +1815,11 @@ Q`)),
         checkAborted(signal);
         if (row) {
           yield { width, height, pixels: pixels() };
-          log("\uC774\uBBF8\uC9C0 PDF \uD398\uC774\uC9C0 \uC0DD\uC131", `${++pageCount}\uD398\uC774\uC9C0`);
+          log("\uC774\uBBF8\uC9C0 \uD398\uC774\uC9C0 \uC0DD\uC131", `${++pageCount}\uD398\uC774\uC9C0`);
         }
       }
       try {
-        const result = await generateImagePdf(renderedPages(), {
+        const result = await (options.encodePages || generateImagePdf)(renderedPages(), { /* PAGEFOLD FORK */
           sourceCharacters: String(transcript || "").length,
           fontSize,
           lineHeight,
@@ -1526,8 +2069,8 @@ Q`)),
   }
 
   // src/toast.js
-  var STACK_CLASS = "pagefold-request-toast-stack";
-  var CARD_CLASS_PREFIX = "pagefold-request-toast-card-";
+  var STACK_CLASS = "pagefold-fork-request-toast-stack"; /* PAGEFOLD FORK */
+  var CARD_CLASS_PREFIX = "pagefold-fork-request-toast-card-"; /* PAGEFOLD FORK */
   var HORIZONTAL_DISMISS_DISTANCE = 60;
   var UPWARD_DISMISS_DISTANCE = 50;
   var DISMISS_ANIMATION_MS = 180;
@@ -1728,7 +2271,7 @@ Q`)),
       const accent = accentColor(entry.tone);
       const detail = entry.detail ? ` \xB7 ${escapeHtml(entry.detail)}` : "";
       const metrics = entry.metrics || {};
-      const pdf = Number(metrics.pdfPages) > 0 ? `<div style="margin-top:5px;color:#94a3b8">PDF <span style="color:#e2e8f0;font-weight:650">${formatCount(metrics.pdfPages)}p</span>${Number(metrics.pdfBytes) > 0 ? ` \xB7 ${formatCount(metrics.pdfBytes)} bytes` : ""}</div>` : "";
+      const pdf = Number(metrics.pdfPages) > 0 ? `<div style="margin-top:5px;color:#94a3b8">\uD30C\uC77C <span style="color:#e2e8f0;font-weight:650">${formatCount(metrics.pdfPages)}p</span>${Number(metrics.pdfBytes) > 0 ? ` \xB7 ${formatCount(metrics.pdfBytes)} bytes` : ""}</div>` : "";
       const baseline = Math.max(0, Number(metrics.baselineTokens) || 0);
       const optimized = Math.max(0, Number(metrics.optimizedTokens) || 0);
       const delta = optimized - baseline;
@@ -1818,6 +2361,7 @@ Q`)),
     const localStorage = supportsLocalPluginStorage ? await api.getLocalPluginStorage() : api.pluginStorage;
     const syncedStorage = supportsLocalPluginStorage && api.pluginStorage && typeof api.pluginStorage.getItem === "function" && typeof api.pluginStorage.setItem === "function" ? api.pluginStorage : null;
     async function loadConfig() {
+      await pagefoldForkImportUpstreamConfig(localStorage, syncedStorage); /* PAGEFOLD FORK */
       const localValue = await localStorage.getItem(CONFIG_KEY);
       if (!syncedStorage) return normalizeConfig(localValue);
       try {
@@ -1892,6 +2436,7 @@ Q`)),
         packagingMode: profile.packagingMode,
         pdfRenderMode: profile.pdfRenderMode,
         imageFontSize: profile.imageFontSize,
+        imageResolution: profile.imageResolution, /* PAGEFOLD FORK */
         [provider]: {
           ...value[provider],
           model: profile.model,
@@ -1966,27 +2511,28 @@ Q`)),
       return (hash >>> 0).toString(16);
     }
     async function createPdf(document2, currentConfig, signal, log) {
-      const renderMode = currentConfig.pdfRenderMode === "image" ? "image" : "text";
-      const fontSize = renderMode === "image" ? currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE : currentConfig.pdfFontSize ?? DEFAULT_PDF_FONT_SIZE;
+      const renderMode = pagefoldForkRenderMode(currentConfig.pdfRenderMode); /* PAGEFOLD FORK */
+      const fontSize = pagefoldForkIsImageMode(renderMode) /* PAGEFOLD FORK */ ? currentConfig.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE : currentConfig.pdfFontSize ?? DEFAULT_PDF_FONT_SIZE;
       const cacheKey = simpleHash(JSON.stringify({
         transcript: document2.transcript,
         fontSize,
-        renderMode
+        renderMode,
+        imageResolution: currentConfig.imageResolution /* PAGEFOLD FORK */
       }));
       if (pdfCache.has(cacheKey)) {
         const value2 = pdfCache.get(cacheKey);
         pdfCache.delete(cacheKey);
         pdfCache.set(cacheKey, value2);
-        log("PDF \uBA54\uBAA8\uB9AC \uCE90\uC2DC \uC0AC\uC6A9", `${document2.name} / ${value2.pageCount}\uD398\uC774\uC9C0 / ${fontSize}pt`);
+        log("\uD30C\uC77C \uBA54\uBAA8\uB9AC \uCE90\uC2DC \uC0AC\uC6A9", `${document2.name} / ${value2.pageCount}\uD398\uC774\uC9C0 / ${fontSize}pt`);
         return { ...value2, name: document2.name };
       }
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      log(renderMode === "image" ? "\uC774\uBBF8\uC9C0 PDF \uB80C\uB354\uB9C1 \uC900\uBE44" : "\uBB34\uD3F0\uD2B8 \uD14D\uC2A4\uD2B8 \uB808\uC774\uC5B4 \uC900\uBE44", `${document2.name} / ${document2.transcript.length}\uC790`);
-      log("PDF \uC0DD\uC131 \uC2DC\uC791", `${document2.name} / ${fontSize}pt`);
-      const generate = renderMode === "image" ? generateImageTranscriptPdf : generateTranscriptPdf;
+      log(pagefoldForkIsImageMode(renderMode) /* PAGEFOLD FORK */ ? "\uC774\uBBF8\uC9C0 \uB80C\uB354\uB9C1 \uC900\uBE44" : "\uBB34\uD3F0\uD2B8 \uD14D\uC2A4\uD2B8 \uB808\uC774\uC5B4 \uC900\uBE44", `${document2.name} / ${document2.transcript.length}\uC790`);
+      log("\uD30C\uC77C \uC0DD\uC131 \uC2DC\uC791", `${document2.name} / ${fontSize}pt`);
+      const generate = pagefoldForkIsImageMode(renderMode) /* PAGEFOLD FORK */ ? generateImageTranscriptPdf : generateTranscriptPdf;
       const value = await generate(
         document2.transcript,
-        { fontSize, signal, log }
+        { fontSize, signal, log, ...pagefoldForkRenderOptions(renderMode, currentConfig) /* PAGEFOLD FORK */ }
       );
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const cacheBytes = 32 * 1024 * 1024;
@@ -1996,12 +2542,14 @@ Q`)),
       }
       return { ...value, name: document2.name };
     }
+    const pagefoldForkLab = pagefoldForkCreateLab({ callers: { google: callGoogle, vertex: callVertex, openrouter: callOpenRouter, vercel: callVercelGateway, llmgateway: callLLMGateway }, html, number, routeName, render: generateImageTranscriptPdf, loadRequestLogs, loadConfig, profileConfig }); /* PAGEFOLD FORK */
     async function createPdfs(packed, currentConfig, signal, log) {
       const documents = packed.pdfDocuments || (packed.pdfTranscript ? [{ name: "context", transcript: packed.pdfTranscript }] : []);
       const pdfs = [];
       for (const document2 of documents) {
         pdfs.push(await createPdf(document2, currentConfig, signal, log));
       }
+      pagefoldForkLab.remember(currentConfig, pdfs, packed); /* PAGEFOLD FORK */
       return pdfs;
     }
     function responseError(message, body, status = 0) {
@@ -2575,6 +3123,7 @@ ${account.private_key}`);
             statusCode: Number(completedResult.httpStatus) || void 0,
             requestBody: requestTrace.requestBody ?? null,
             pdfContent: escapeTranscriptNewlines(pdfLogContent),
+            ...pagefoldForkLab.logFields(currentConfig, packed, profile), /* PAGEFOLD FORK */
             responseBody: requestTrace.responseBody ?? null,
             pdfPages,
             pdfBytes,
@@ -2643,6 +3192,7 @@ ${account.private_key}`);
             failureKind,
             requestBody: requestTrace.requestBody ?? null,
             pdfContent: escapeTranscriptNewlines(pdfLogContent),
+            ...pagefoldForkLab.logFields(currentConfig, packed, profile), /* PAGEFOLD FORK */
             responseBody: requestTrace.responseBody ?? sanitizeLogPayload(
               error?.pagefoldResponseBody ?? {
                 error: {
@@ -2687,8 +3237,8 @@ ${account.private_key}`);
         pdfs = await createPdfs(packed, currentConfig, signal, log);
         pdfPages = pdfs.reduce((total, pdf) => total + pdf.pageCount, 0);
         pdfBytes = pdfs.reduce((total, pdf) => total + pdf.bytes.byteLength, 0);
-        log("PDF \uC900\uBE44 \uC644\uB8CC", pdfs.length ? `${pdfs.length}\uAC1C / ${pdfPages}\uD398\uC774\uC9C0 / ${pdfBytes} bytes` : "\uB9C8\uCEE4 PDF \uC5C6\uC74C");
-        const pdfTokensPerPage = currentConfig.pdfRenderMode === "image" ? ["google", "vertex"].includes(currentConfig.activeProvider) ? GEMINI_IMAGE_PDF_TOKENS_PER_PAGE : OPENROUTER_PDF_TOKENS_PER_PAGE : ["openrouter", "vercel", "llmgateway"].includes(currentConfig.activeProvider) && !(currentConfig.activeProvider === "vercel" && route.model.toLowerCase().startsWith("google/")) ? OPENROUTER_PDF_TOKENS_PER_PAGE : GEMINI_PDF_TOKENS_PER_PAGE;
+        log("\uD30C\uC77C \uC900\uBE44 \uC644\uB8CC", pdfs.length ? `${pdfs.length}\uAC1C / ${pdfPages}\uD398\uC774\uC9C0 / ${pdfBytes} bytes` : "\uB9C8\uCEE4 \uD30C\uC77C \uC5C6\uC74C");
+        const pdfTokensPerPage = pagefoldForkTokensPerPage(currentConfig, route.model, pagefoldForkIsImageMode(currentConfig.pdfRenderMode) /* PAGEFOLD FORK */ ? ["google", "vertex"].includes(currentConfig.activeProvider) ? GEMINI_IMAGE_PDF_TOKENS_PER_PAGE : OPENROUTER_PDF_TOKENS_PER_PAGE : ["openrouter", "vercel", "llmgateway"].includes(currentConfig.activeProvider) && !(currentConfig.activeProvider === "vercel" && route.model.toLowerCase().startsWith("google/")) ? OPENROUTER_PDF_TOKENS_PER_PAGE : GEMINI_PDF_TOKENS_PER_PAGE); /* PAGEFOLD FORK */
         const nativeText = packed.nativeMessages ? packed.nativeMessages.map((message) => message.content).join("\n") : `${packed.systemText}
 ${packed.userText}`;
         predictedTokens = pdfPages * pdfTokensPerPage + estimateTextTokens(nativeText);
@@ -2749,9 +3299,9 @@ ${packed.userText}`;
       }
     }
     function ensureStyles() {
-      if (document.getElementById("pagefold-style")) return;
+      if (document.getElementById("pagefold-fork-style" /* PAGEFOLD FORK */)) return;
       const style = document.createElement("style");
-      style.id = "pagefold-style";
+      style.id = "pagefold-fork-style" /* PAGEFOLD FORK */;
       style.textContent = `
       *{box-sizing:border-box} body{margin:0;background:#0b1120;color:#e5e7eb;font:14px/1.5 Inter,system-ui,sans-serif}
       button,input,select,textarea{font:inherit}.pf-app{min-height:100vh;background:linear-gradient(145deg,#0b1120,#111827 60%,#172554)}
@@ -2833,9 +3383,9 @@ ${packed.userText}`;
         <div data-provider-route-field ${["openrouter", "vercel"].includes(profile.provider) ? "" : "hidden"}>${field(`${prefix}-route`, "\uD504\uB85C\uBC14\uC774\uB354 \uACE0\uC815", profile.providerRoute, { placeholder: "vertex", help: "\uC27C\uD45C\uB85C \uAD6C\uBD84\uD55C \uC5C5\uC2A4\uD2B8\uB9BC \uD504\uB85C\uBC14\uC774\uB354\uB97C \uC21C\uC11C\uB300\uB85C \uACE0\uC815\uD569\uB2C8\uB2E4." })}</div>
         ${selectField(`${prefix}-reasoning`, "\uCD94\uB860 \uAC15\uB3C4", profile.reasoningEffort, reasoningChoices(profile.provider), "\uC790\uB3D9\uC740 \uCD94\uB860 \uC124\uC815\uC744 \uD504\uB85C\uBC14\uC774\uB354 \uAE30\uBCF8\uAC12\uC5D0 \uB9E1\uAE41\uB2C8\uB2E4.")}
         ${selectField(`${prefix}-tier`, "\uC11C\uBE44\uC2A4 \uD2F0\uC5B4", profile.serviceTier, serviceTierChoices, "\uC9C0\uC6D0 \uBAA8\uB378\uC5D0\uC11C\uB9CC \uB3D9\uC791\uD569\uB2C8\uB2E4.")}
-        ${selectField(`${prefix}-packaging-mode`, "\uD328\uD0A4\uC9D5 \uBAA8\uB4DC", profile.packagingMode ?? DEFAULT_CONFIG.packagingMode, [["maximum", "\uC808\uC57D"], ["balanced", "\uC548\uC815"], ["marked", "\uB9C8\uCEE4"], ["marked_combined", "\uB9C8\uCEE4(\uD1B5\uD569)"]], "\uC774 \uBAA8\uB378 \uD504\uB9AC\uC14B\uC5D0\uB9CC \uC801\uC6A9\uB429\uB2C8\uB2E4. \uC808\uC57D\uC740 \uC804\uCCB4 \uB300\uD654\uB97C PDF\uC5D0 \uB123\uACE0, \uC548\uC815\uC740 system\uB9CC \uC6D0\uBB38\uC73C\uB85C \uC720\uC9C0\uD569\uB2C8\uB2E4. \uB9C8\uCEE4\uB294 \uC774\uB984\uBCC4 PDF\uB97C \uB9CC\uB4E4\uACE0, \uB9C8\uCEE4(\uD1B5\uD569)\uB294 \uBAA8\uB4E0 &lt;pdf&gt; \uBE14\uB85D\uC744 root PDF \uD558\uB098\uB85C \uD569\uCE69\uB2C8\uB2E4. \uC800\uC7A5 \uD6C4 \uB2E4\uC74C \uC694\uCCAD\uBD80\uD130 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.")}
-        ${selectField(`${prefix}-pdf-mode`, "PDF \uBCC0\uD658 \uBC29\uC2DD", profile.pdfRenderMode || "text", [["text", "\uD14D\uC2A4\uD2B8"], ["image", "\uC774\uBBF8\uC9C0"]], "\uC774 \uBAA8\uB378 \uD504\uB9AC\uC14B\uC5D0\uB9CC \uC801\uC6A9\uB429\uB2C8\uB2E4. \uC774\uBBF8\uC9C0\uB294 \uAE00\uC790\uB97C \uADF8\uB9BC\uC73C\uB85C \uC800\uC7A5\uD558\uBA70 Google\xB7Vertex\uC5D0\uC11C\uB294 \uB192\uC740 \uD574\uC0C1\uB3C4\uB85C \uC77D\uC5B4 \uD398\uC774\uC9C0\uB2F9 \uD1A0\uD070 \uC0AC\uC6A9\uB7C9\uC774 \uB298\uC5B4\uB0A9\uB2C8\uB2E4. \uC800\uC7A5 \uD6C4 \uB2E4\uC74C \uC694\uCCAD\uBD80\uD130 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.")}
-        <div data-image-pdf-settings ${profile.pdfRenderMode === "image" ? "" : "hidden"}>${field(`${prefix}-image-font-size`, "\uC774\uBBF8\uC9C0 PDF \uAE00\uC790 \uD06C\uAE30 (pt)", profile.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE, { type: "number", step: "0.1", min: "2", max: "24", help: "\uAE30\uBCF8\uAC12\uC740 8pt\uC785\uB2C8\uB2E4. \uC791\uC744\uC218\uB85D \uB354 \uB9CE\uC740 \uAE00\uC790\uAC00 \uB4E4\uC5B4\uAC00\uC9C0\uB9CC \uBAA8\uB378\uC774 \uC77D\uAE30 \uC5B4\uB824\uC6CC\uC9C8 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uCCAB \uC0AC\uC6A9 \uC2DC \uD55C\uAE00\xB7\uC774\uBAA8\uC9C0 \uAE00\uAF34\uC744 \uB0B4\uB824\uBC1B\uC544 \uC774 \uAE30\uAE30\uC5D0 \uBCF4\uAD00\uD569\uB2C8\uB2E4." })}</div>
+        ${selectField(`${prefix}-packaging-mode`, "\uD328\uD0A4\uC9D5 \uBAA8\uB4DC", profile.packagingMode ?? DEFAULT_CONFIG.packagingMode, [["maximum", "\uC808\uC57D"], ["balanced", "\uC548\uC815"], ["marked", "\uB9C8\uCEE4"], ["marked_combined", "\uB9C8\uCEE4(\uD1B5\uD569)"]], "\uC774 \uBAA8\uB378 \uD504\uB9AC\uC14B\uC5D0\uB9CC \uC801\uC6A9\uB429\uB2C8\uB2E4. \uC808\uC57D\uC740 \uC804\uCCB4 \uB300\uD654\uB97C \uD30C\uC77C\uC5D0 \uB123\uACE0, \uC548\uC815\uC740 system\uB9CC \uC6D0\uBB38\uC73C\uB85C \uC720\uC9C0\uD569\uB2C8\uB2E4. \uB9C8\uCEE4\uB294 \uC774\uB984\uBCC4 \uD30C\uC77C\uC744 \uB9CC\uB4E4\uACE0, \uB9C8\uCEE4(\uD1B5\uD569)\uB294 \uBAA8\uB4E0 &lt;pdf&gt; \uBE14\uB85D\uC744 root \uD30C\uC77C \uD558\uB098\uB85C \uD569\uCE69\uB2C8\uB2E4. \uC800\uC7A5 \uD6C4 \uB2E4\uC74C \uC694\uCCAD\uBD80\uD130 \uC0AC\uC6A9\uD569\uB2C8\uB2E4.")}
+        ${selectField(`${prefix}-pdf-mode`, PAGEFOLD_FORK_RENDER_MODE_LABEL, pagefoldForkRenderMode(profile.pdfRenderMode, profile.model), PAGEFOLD_FORK_RENDER_MODE_CHOICES, PAGEFOLD_FORK_RENDER_MODE_HELP) /* PAGEFOLD FORK */}
+        <div data-image-pdf-settings ${pagefoldForkIsImageMode(pagefoldForkRenderMode(profile.pdfRenderMode, profile.model)) /* PAGEFOLD FORK */ ? "" : "hidden"}>${field(`${prefix}-image-font-size`, "\uC774\uBBF8\uC9C0 \uAE00\uC790 \uD06C\uAE30 (pt)", profile.imageFontSize ?? DEFAULT_IMAGE_FONT_SIZE, { type: "number", step: "0.1", min: "2", max: "24", help: "\uAE30\uBCF8\uAC12\uC740 8pt\uC785\uB2C8\uB2E4. \uC791\uC744\uC218\uB85D \uB354 \uB9CE\uC740 \uAE00\uC790\uAC00 \uB4E4\uC5B4\uAC00\uC9C0\uB9CC \uBAA8\uB378\uC774 \uC77D\uAE30 \uC5B4\uB824\uC6CC\uC9C8 \uC218 \uC788\uC2B5\uB2C8\uB2E4. \uCCAB \uC0AC\uC6A9 \uC2DC \uD55C\uAE00\xB7\uC774\uBAA8\uC9C0 \uAE00\uAF34\uC744 \uB0B4\uB824\uBC1B\uC544 \uC774 \uAE30\uAE30\uC5D0 \uBCF4\uAD00\uD569\uB2C8\uB2E4." })}${selectField(`${prefix}-image-resolution`, PAGEFOLD_FORK_RESOLUTION_LABEL, pagefoldForkResolution(profile.imageResolution), PAGEFOLD_FORK_RESOLUTION_CHOICES, PAGEFOLD_FORK_RESOLUTION_HELP) /* PAGEFOLD FORK */}</div>
       </div>
       <details class="pf-advanced">
         <summary>\uACE0\uAE09 \uD30C\uB77C\uBBF8\uD130</summary>
@@ -2861,9 +3411,9 @@ ${packed.userText}`;
     }
     function settingsView() {
       return `<div id="pf-settings"><div class="pf-grid">
-      <section class="pf-card full"><h2>\uACF5\uD1B5 PDF \uC124\uC815</h2>
-        ${field("pdf-font-size", "\uD14D\uC2A4\uD2B8 PDF \uAE00\uC790 \uD06C\uAE30 (pt)", config.pdfFontSize, { type: "number", step: "0.1", min: "0.5", max: "12", help: "\uD14D\uC2A4\uD2B8 \uBC29\uC2DD\uC5D0 \uC801\uC6A9\uB418\uBA70 \uAE30\uBCF8\uAC12\uC740 1pt\uC785\uB2C8\uB2E4. \uC774\uBBF8\uC9C0 \uBC29\uC2DD\uACFC \uC774\uBBF8\uC9C0 \uAE00\uC790 \uD06C\uAE30\uB294 \uBAA8\uB378 \uD504\uB9AC\uC14B\uC5D0\uC11C \uC120\uD0DD\uD569\uB2C8\uB2E4." })}
-        ${checkboxField("merge-consecutive-roles", "\uC5F0\uC18D \uC5ED\uD560 \uBCD1\uD569", config.mergeConsecutiveRoles, "\uC5F0\uC18D\uB41C system \uB610\uB294 user \uBA54\uC2DC\uC9C0\uB97C \uD558\uB098\uB85C \uD569\uCCD0 PDF \uC804\uC1A1\uB7C9\uC744 \uC904\uC785\uB2C8\uB2E4. \uC5B4\uC2DC\uC2A4\uD134\uD2B8 \uBA54\uC2DC\uC9C0\uB294 \uD56D\uC0C1 \uAC1C\uBCC4 \uC720\uC9C0\uB429\uB2C8\uB2E4.")}
+      <section class="pf-card full"><h2>\uACF5\uD1B5 \uC124\uC815</h2>
+        ${field("pdf-font-size", "PDF \uD14D\uC2A4\uD2B8 \uAE00\uC790 \uD06C\uAE30 (pt)", config.pdfFontSize, { type: "number", step: "0.1", min: "0.5", max: "12", help: "\uD14D\uC2A4\uD2B8 \uBC29\uC2DD\uC5D0 \uC801\uC6A9\uB418\uBA70 \uAE30\uBCF8\uAC12\uC740 1pt\uC785\uB2C8\uB2E4. \uC774\uBBF8\uC9C0 \uBC29\uC2DD\uACFC \uC774\uBBF8\uC9C0 \uAE00\uC790 \uD06C\uAE30\uB294 \uBAA8\uB378 \uD504\uB9AC\uC14B\uC5D0\uC11C \uC120\uD0DD\uD569\uB2C8\uB2E4." })}
+        ${checkboxField("merge-consecutive-roles", "\uC5F0\uC18D \uC5ED\uD560 \uBCD1\uD569", config.mergeConsecutiveRoles, "\uC5F0\uC18D\uB41C system \uB610\uB294 user \uBA54\uC2DC\uC9C0\uB97C \uD558\uB098\uB85C \uD569\uCCD0 \uD30C\uC77C \uC804\uC1A1\uB7C9\uC744 \uC904\uC785\uB2C8\uB2E4. \uC5B4\uC2DC\uC2A4\uD134\uD2B8 \uBA54\uC2DC\uC9C0\uB294 \uD56D\uC0C1 \uAC1C\uBCC4 \uC720\uC9C0\uB429\uB2C8\uB2E4.")}
         ${checkboxField("request-toast", "\uC694\uCCAD \uD1A0\uC2A4\uD2B8 \uB744\uC6B0\uAE30", config.requestToast)}
       </section>
       <section class="pf-card full"><h2>\uB4F1\uB85D \uBAA8\uB378</h2>
@@ -2932,7 +3482,7 @@ ${packed.userText}`;
       const pageRecent = recent.slice(pageStart, pageStart + pageSize);
       const pageEnd = Math.min(pageStart + pageRecent.length, recent.length);
       const pagination = recent.length > pageSize ? `<div class="pf-pagination"><button class="pf-button" type="button" data-stats-page="${statsPage - 1}" ${statsPage === 1 ? "disabled" : ""}>\uC774\uC804</button><span class="pf-page-info">${number(pageStart + 1)}\u2013${number(pageEnd)} / ${number(recent.length)}</span><button class="pf-button" type="button" data-stats-page="${statsPage + 1}" ${statsPage === pageCount ? "disabled" : ""}>\uB2E4\uC74C</button></div>` : "";
-      return `<div class="pf-stats-toolbar"><h2>\uD1B5\uACC4 \uC694\uC57D</h2><div class="pf-stats-actions"><label class="pf-log-switch"><input id="pf-request-logging" type="checkbox" ${config.requestLogging ? "checked" : ""}><span>\uC694\uCCAD \uB85C\uADF8 \uC800\uC7A5</span><small>\uCD5C\uADFC 20\uAC1C</small></label><button id="pf-export-logs" class="pf-button" type="button" ${requestLogs.entries.length ? "" : "disabled"}>\uB85C\uADF8 \uB0B4\uBCF4\uB0B4\uAE30</button><button id="pf-reset-stats" class="pf-button danger" type="button">\uD1B5\uACC4 \uCD08\uAE30\uD654</button></div></div>
+      return `<div class="pf-stats-toolbar"><h2>\uD1B5\uACC4 \uC694\uC57D</h2><div class="pf-stats-actions"><label class="pf-log-switch"><input id="pf-request-logging" type="checkbox" ${config.requestLogging ? "checked" : ""}><span>\uC694\uCCAD \uB85C\uADF8 \uC800\uC7A5</span><small>\uCD5C\uADFC 20\uAC1C</small></label><button id="pf-export-logs" class="pf-button" type="button" ${requestLogs.entries.length ? "" : "disabled"}>\uB85C\uADF8 \uB0B4\uBCF4\uB0B4\uAE30</button>${pagefoldForkLab.toolbarHtml() /* PAGEFOLD FORK */}<button id="pf-reset-stats" class="pf-button danger" type="button">\uD1B5\uACC4 \uCD08\uAE30\uD654</button></div></div><div id="pff-lab-output"></div><!-- PAGEFOLD FORK -->
     <div class="pf-stat-grid">
       <div class="pf-stat"><span>\uC804\uCCB4 \uC694\uCCAD</span><strong>${number(total.requests)}</strong></div>
       <div class="pf-stat"><span>\uCD1D \uC785\uB825 \uD1A0\uD070</span><strong>${number(totalInputTokens)}</strong></div>
@@ -2940,7 +3490,7 @@ ${packed.userText}`;
       <div class="pf-stat"><span>\uC808\uC57D\uB41C \uD1A0\uD070</span><strong>${number(total.savedTokens)}</strong></div>
       <div class="pf-stat"><span>\uC808\uC57D\uB960</span><strong>${number(totalReductionRate, 1)}%</strong></div>
       <div class="pf-stat"><span>\uC608\uC0C1 \uC808\uC57D\uC561</span><strong>${usd(total.savedUsd)}</strong></div>
-      <div class="pf-stat"><span>\uC0DD\uC131 PDF \uD398\uC774\uC9C0</span><strong>${number(total.pdfPages)}</strong></div>
+      <div class="pf-stat"><span>\uC0DD\uC131 \uD398\uC774\uC9C0</span><strong>${number(total.pdfPages)}</strong></div>
     </div>
     <section class="pf-card full"><h2>\uD504\uB85C\uBC14\uC774\uB354\xB7\uBAA8\uB378\uBCC4 \uD1B5\uACC4</h2><div class="pf-table-wrap">${routes.length ? `<table class="pf-table"><thead><tr><th>\uD504\uB85C\uBC14\uC774\uB354</th><th>\uBAA8\uB378</th><th>\uC694\uCCAD</th><th>\uC131\uACF5\uB960</th><th>\uC785\uB825 \uD1A0\uD070</th><th>\uCD9C\uB825 \uD1A0\uD070</th><th>\uC808\uC57D\uB41C \uD1A0\uD070</th><th>\uC608\uC0C1 \uC808\uC57D\uC561</th></tr></thead><tbody>${routes.map(([key, row]) => {
         const [provider, model] = key.split("\0");
@@ -2948,7 +3498,7 @@ ${packed.userText}`;
         const outputTokens = outputTokenBreakdown(provider, row.outputTokens, row.reasoningTokens).total;
         return `<tr><td>${html(routeName(provider))}</td><td>${html(model)}</td><td>${number(row.requests)}</td><td>${number(successRate, 1)}%</td><td>${number(row.optimizedTokens)}</td><td>${number(outputTokens)}</td><td>${number(row.savedTokens)}</td><td>${usd(row.savedUsd)}</td></tr>`;
       }).join("")}</tbody></table>` : '<div class="pf-empty">\uC544\uC9C1 \uD1B5\uACC4\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.</div>'}</div></section>
-    <section class="pf-card full" style="margin-top:14px"><h2>\uCD5C\uADFC \uC694\uCCAD</h2><div class="pf-table-wrap">${pageRecent.length ? `<table class="pf-table"><thead><tr><th>\uC2DC\uAC04</th><th>\uACBD\uB85C</th><th>\uCD94\uB860</th><th>\uD2F0\uC5B4</th><th>PDF</th><th>\uC785\uB825 \uD1A0\uD070</th><th>\uCD9C\uB825 \uD1A0\uD070</th><th>\uC808\uC57D\uB960</th><th>\uC751\uB2F5 \uC2DC\uAC04</th><th>\uC0C1\uD0DC</th></tr></thead><tbody>${pageRecent.map((row) => {
+    <section class="pf-card full" style="margin-top:14px"><h2>\uCD5C\uADFC \uC694\uCCAD</h2><div class="pf-table-wrap">${pageRecent.length ? `<table class="pf-table"><thead><tr><th>\uC2DC\uAC04</th><th>\uACBD\uB85C</th><th>\uCD94\uB860</th><th>\uD2F0\uC5B4</th><th>\uD30C\uC77C</th><th>\uC785\uB825 \uD1A0\uD070</th><th>\uCD9C\uB825 \uD1A0\uD070</th><th>\uC808\uC57D\uB960</th><th>\uC751\uB2F5 \uC2DC\uAC04</th><th>\uC0C1\uD0DC</th></tr></thead><tbody>${pageRecent.map((row) => {
         const baseline = Number(row.baselineTokens) || 0;
         const optimized = Number(row.optimizedTokens) || 0;
         const delta = optimized - baseline;
@@ -3016,10 +3566,10 @@ ${packed.userText}`;
       document.body.insertAdjacentHTML("beforeend", `<div id="pf-request-log-modal" class="pf-modal" role="presentation">
       <div class="pf-log-dialog" role="dialog" aria-modal="true" aria-labelledby="pf-request-log-title">
         <header class="pf-log-header"><div><h2 id="pf-request-log-title">\uC694\uCCAD \uB85C\uADF8</h2><div class="pf-log-meta">${html(metadata)}</div></div><button class="pf-log-close" type="button" aria-label="\uB2EB\uAE30">\xD7</button></header>
-        <nav class="pf-log-tabs"><button class="pf-log-tab active" type="button" data-log-tab="request">\uC694\uCCAD \uBCF8\uBB38</button><button class="pf-log-tab" type="button" data-log-tab="pdf">PDF \uB0B4\uC6A9</button><button class="pf-log-tab" type="button" data-log-tab="response">\uC751\uB2F5 \uBCF8\uBB38</button></nav>
+        <nav class="pf-log-tabs"><button class="pf-log-tab active" type="button" data-log-tab="request">\uC694\uCCAD \uBCF8\uBB38</button><button class="pf-log-tab" type="button" data-log-tab="pdf">\uD30C\uC77C \uBCF8\uBB38</button><!-- PAGEFOLD FORK --><button class="pf-log-tab" type="button" data-log-tab="response">\uC751\uB2F5 \uBCF8\uBB38</button></nav>
         <div class="pf-log-content">
           <section class="pf-log-panel" data-log-panel="request"><pre>${html(requestLogBodyText(entry.requestBody))}</pre></section>
-          <section class="pf-log-panel" data-log-panel="pdf" hidden><p class="pf-log-panel-info">${number(entry.pdfPages)}\uD398\uC774\uC9C0 \xB7 ${number(entry.pdfBytes)} bytes</p><pre>${html(entry.pdfContent || "\uAE30\uB85D\uB41C PDF \uB0B4\uC6A9\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.")}</pre></section>
+          <section class="pf-log-panel" data-log-panel="pdf" hidden><p class="pf-log-panel-info">${number(entry.pdfPages)}\uD398\uC774\uC9C0 \xB7 ${number(entry.pdfBytes)} bytes</p><pre>${html(entry.pdfContent || "\uAE30\uB85D\uB41C \uD30C\uC77C \uBCF8\uBB38\uC774 \uC5C6\uC2B5\uB2C8\uB2E4." /* PAGEFOLD FORK */)}</pre></section>
           <section class="pf-log-panel" data-log-panel="response" hidden><pre>${html(requestLogBodyText(entry.responseBody))}</pre></section>
         </div>
       </div>
@@ -3065,6 +3615,7 @@ ${packed.userText}`;
           packagingMode: get(`profile-${id}-packaging-mode`),
           pdfRenderMode: get(`profile-${id}-pdf-mode`),
           imageFontSize: get(`profile-${id}-image-font-size`),
+          imageResolution: get(`profile-${id}-image-resolution`), /* PAGEFOLD FORK */
           providerRoute: get(`profile-${id}-route`),
           inputPrice: get(`profile-${id}-price`),
           parameters: {
@@ -3130,8 +3681,9 @@ ${packed.userText}`;
       const id = row.dataset.profileId;
       document.getElementById(`profile-${id}-pdf-mode`)?.addEventListener("change", (event) => {
         const settings = row.querySelector("[data-image-pdf-settings]");
-        if (settings) settings.hidden = event.target.value !== "image";
+        if (settings) settings.hidden = !pagefoldForkIsImageMode(event.target.value); /* PAGEFOLD FORK */
       });
+      pagefoldForkBindRenderModeLimit(id); /* PAGEFOLD FORK */
       row.querySelector("[data-remove-profile]")?.addEventListener("click", () => {
         row.remove();
         if (!document.querySelector(".pf-model-profile")) {
@@ -3184,7 +3736,7 @@ ${packed.userText}`;
       config = await loadConfig();
       const activeTab = tab === "stats" ? "stats" : "settings";
       document.body.innerHTML = `<main class="pf-app"><div class="pf-shell">
-      <header class="pf-header"><h1 class="pf-title">PageFold</h1><button id="pf-close" class="pf-close" aria-label="\uB2EB\uAE30">\xD7</button></header>
+      <header class="pf-header"><h1 class="pf-title">PageFold Fork</h1><!-- PAGEFOLD FORK --><button id="pf-close" class="pf-close" aria-label="\uB2EB\uAE30">\xD7</button></header>
       <nav class="pf-tabs" role="tablist"><button class="pf-tab ${activeTab === "settings" ? "active" : ""}" data-tab="settings" role="tab">\uC124\uC815</button><button class="pf-tab ${activeTab === "stats" ? "active" : ""}" data-tab="stats" role="tab">\uD1B5\uACC4</button></nav>
       ${message ? `<div class="pf-message ${warning ? "warning" : ""}">${html(message)}</div>` : ""}
       <div id="pf-view">${activeTab === "stats" ? await statsView() : settingsView()}</div>
@@ -3260,6 +3812,7 @@ ${packed.userText}`;
           providerRegistrationChanged
         );
       });
+      pagefoldForkLab.bind(); /* PAGEFOLD FORK */
       document.getElementById("pf-reset-stats")?.addEventListener("click", async () => {
         if (typeof confirm === "function" && !confirm("PageFold \uD1B5\uACC4\uC640 \uC800\uC7A5\uB41C \uC694\uCCAD \uB85C\uADF8\uB97C \uCD08\uAE30\uD654\uD560\uAE4C\uC694?")) return;
         await Promise.all([statsWriteQueue, requestLogWriteQueue]);
@@ -3269,10 +3822,10 @@ ${packed.userText}`;
         await renderApp("stats", "\uD1B5\uACC4\uC640 \uC694\uCCAD \uB85C\uADF8\uB97C \uCD08\uAE30\uD654\uD588\uC2B5\uB2C8\uB2E4.");
       });
     }
-    await api.registerSetting("PageFold", async () => {
+    await api.registerSetting("PageFold Fork", async () => { /* PAGEFOLD FORK */
       await renderApp("settings");
       await api.showContainer("fullscreen");
-    }, "PF", "html", PAGEFOLD_ID);
+    }, "PFF", "html", PAGEFOLD_ID); /* PAGEFOLD FORK */
     for (const profile of config.models) {
       const registrationName = profileRegistrationName(profile);
       await api.addProvider(
@@ -3282,9 +3835,9 @@ ${packed.userText}`;
           structuredOutput: true,
           overrideRequestStatus: config.requestToast === true,
           model: {
-            name: profile.name,
-            shortName: profile.name,
-            fullName: profile.name,
+            name: pagefoldForkModelName(profile.name), /* PAGEFOLD FORK */
+            shortName: pagefoldForkModelName(profile.name), /* PAGEFOLD FORK */
+            fullName: pagefoldForkModelName(profile.name), /* PAGEFOLD FORK */
             internalID: `pluginmodel:::${registrationName}`,
             flags: profile.streaming ? [6, 8] : [6],
             tokenizer: RISU_TOKENIZER_GOOGLE_CLOUD
